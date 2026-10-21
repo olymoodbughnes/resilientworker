@@ -1,0 +1,18 @@
+{
+  "name": "resilientworker",
+  "version": "1.0.0",
+  "description": "A fault-tolerant background job processor built with Node.js and TypeScript, featuring automatic retries, exponential backoff, circuit breakers, dead-letter queues, and monitoring.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12"
+  }
+}
