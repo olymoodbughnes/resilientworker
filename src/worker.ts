@@ -20,7 +20,7 @@ export class Worker {
   }
 
   async processNext(): Promise<boolean> {
-    const task = this.queue.claimOldest();
+    const task = await this.queue.claimOldest();
 
     if (!task) {
       console.log("No pending tasks.");
@@ -36,7 +36,7 @@ export class Worker {
 
         await this.circuit.execute(() => sendEmail(task.payload));
 
-        this.queue.complete(task.id);
+        await this.queue.complete(task.id);
         this.metrics.recordSuccess(Date.now() - startedAt);
         console.log(`Task ${task.id} completed.`);
         return true;
@@ -47,7 +47,7 @@ export class Worker {
         );
 
         if (attempt === this.maxAttempts) {
-          this.queue.moveToDeadLetter(task.id);
+          await this.queue.moveToDeadLetter(task.id);
           this.metrics.recordFailure(Date.now() - startedAt);
           console.error(`Task ${task.id} moved to dead-letter queue.`);
         }

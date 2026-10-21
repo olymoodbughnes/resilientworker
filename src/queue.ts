@@ -1,3 +1,5 @@
+import { pool } from "./db";
+
 export type TaskStatus = "pending" | "processing" | "completed" | "failed";
 
 export type Task<T = unknown> = {
@@ -16,116 +18,192 @@ export type CompletionStatus = {
   total: number;
 };
 
-let nextId = 1;
+type TaskRow = {
+  id: string;
+  payload: unknown;
+  status: TaskStatus;
+  attempts: number;
+  created_at: string;
+};
+
+function mapRow<T>(row: TaskRow): Task<T> {
+  return {
+    id: String(row.id),
+    payload: row.payload as T,
+    status: row.status,
+    attempts: row.attempts,
+    createdAt: Number(row.created_at),
+  };
+}
 
 export class TaskQueue<T = unknown> {
-  private tasks: Task<T>[] = [];
-  private deadLetters: Task<T>[] = [];
+  /** Snapshot of how many active (non-dead-letter) tasks are in each status. */
+  async getCompletionStatus(): Promise<CompletionStatus> {
+    const { rows } = await pool.query<{ status: TaskStatus; count: string }>(`
+      SELECT status, COUNT(*)::text AS count
+      FROM tasks
+      WHERE dead_letter = FALSE
+      GROUP BY status
+    `);
 
-  /** Snapshot of how many tasks are in each status. */
-  get completionStatus(): CompletionStatus {
     const status: CompletionStatus = {
       pending: 0,
       processing: 0,
       completed: 0,
       failed: 0,
-      total: this.tasks.length,
+      total: 0,
     };
 
-    for (const task of this.tasks) {
-      status[task.status]++;
+    for (const row of rows) {
+      const key = row.status as TaskStatus;
+      const count = Number(row.count);
+      status[key] = count;
+      status.total += count;
     }
 
     return status;
   }
 
   /** Add a task to the end of the queue. */
-  add(payload: T): Task<T> {
-    const task: Task<T> = {
-      id: String(nextId++),
-      payload,
-      status: "pending",
-      attempts: 0,
-      createdAt: Date.now(),
-    };
+  async add(payload: T): Promise<Task<T>> {
+    const createdAt = Date.now();
+    const { rows } = await pool.query<TaskRow>(
+      `
+      INSERT INTO tasks (payload, status, attempts, created_at, dead_letter)
+      VALUES ($1::jsonb, 'pending', 0, $2, FALSE)
+      RETURNING id::text, payload, status, attempts, created_at::text
+      `,
+      [JSON.stringify(payload), createdAt],
+    );
 
-    this.tasks.push(task);
-    return task;
+    const row = rows[0];
+    if (!row) {
+      throw new Error("Failed to insert task");
+    }
+
+    return mapRow<T>(row);
   }
 
   /**
    * Take the oldest pending task, mark it as processing, bump attempts, and return it.
    * Returns undefined when there is nothing pending.
    */
-  claimOldest(): Task<T> | undefined {
-    const task = this.tasks.find((t) => t.status === "pending");
-    if (!task) {
-      return undefined;
-    }
+  async claimOldest(): Promise<Task<T> | undefined> {
+    const client = await pool.connect();
 
-    task.status = "processing";
-    task.attempts += 1;
-    return task;
+    try {
+      await client.query("BEGIN");
+
+      const { rows } = await client.query<TaskRow>(`
+        SELECT id::text, payload, status, attempts, created_at::text
+        FROM tasks
+        WHERE status = 'pending' AND dead_letter = FALSE
+        ORDER BY created_at ASC, id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      `);
+
+      const row = rows[0];
+      if (!row) {
+        await client.query("COMMIT");
+        return undefined;
+      }
+
+      const { rows: updated } = await client.query<TaskRow>(
+        `
+        UPDATE tasks
+        SET status = 'processing', attempts = attempts + 1
+        WHERE id = $1::bigint
+        RETURNING id::text, payload, status, attempts, created_at::text
+        `,
+        [row.id],
+      );
+
+      await client.query("COMMIT");
+
+      const claimed = updated[0];
+      return claimed ? mapRow<T>(claimed) : undefined;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
-  /** Snapshot of all tasks, oldest first. Returned tasks are frozen copies. */
-  getAll(): ReadonlyArray<Readonly<Task<T>>> {
-    return this.tasks.map((task) => Object.freeze({ ...task }));
+  /** Snapshot of all active tasks, oldest first. Returned tasks are frozen copies. */
+  async getAll(): Promise<ReadonlyArray<Readonly<Task<T>>>> {
+    const { rows } = await pool.query<TaskRow>(`
+      SELECT id::text, payload, status, attempts, created_at::text
+      FROM tasks
+      WHERE dead_letter = FALSE
+      ORDER BY created_at ASC, id ASC
+    `);
+
+    return rows.map((row) => Object.freeze(mapRow<T>(row)));
   }
 
   /** Mark a processing task as completed. Ignores tasks that are not processing. */
-  complete(id: string): Task<T> | undefined {
-    const task = this.findProcessing(id);
-    if (!task) {
-      return undefined;
-    }
+  async complete(id: string): Promise<Task<T> | undefined> {
+    const { rows } = await pool.query<TaskRow>(
+      `
+      UPDATE tasks
+      SET status = 'completed'
+      WHERE id = $1::bigint AND status = 'processing' AND dead_letter = FALSE
+      RETURNING id::text, payload, status, attempts, created_at::text
+      `,
+      [id],
+    );
 
-    task.status = "completed";
-    return task;
+    const row = rows[0];
+    return row ? mapRow<T>(row) : undefined;
   }
 
   /** Mark a processing task as failed. Ignores tasks that are not processing. */
-  fail(id: string): Task<T> | undefined {
-    const task = this.findProcessing(id);
-    if (!task) {
-      return undefined;
-    }
+  async fail(id: string): Promise<Task<T> | undefined> {
+    const { rows } = await pool.query<TaskRow>(
+      `
+      UPDATE tasks
+      SET status = 'failed'
+      WHERE id = $1::bigint AND status = 'processing' AND dead_letter = FALSE
+      RETURNING id::text, payload, status, attempts, created_at::text
+      `,
+      [id],
+    );
 
-    task.status = "failed";
-    return task;
+    const row = rows[0];
+    return row ? mapRow<T>(row) : undefined;
   }
 
   /**
    * Move a processing or failed task into the dead-letter collection.
-   * Removes it from the active queue.
    */
-  moveToDeadLetter(id: string): Task<T> | undefined {
-    const index = this.tasks.findIndex((t) => t.id === id);
-    if (index === -1) {
-      return undefined;
-    }
+  async moveToDeadLetter(id: string): Promise<Task<T> | undefined> {
+    const { rows } = await pool.query<TaskRow>(
+      `
+      UPDATE tasks
+      SET status = 'failed', dead_letter = TRUE
+      WHERE id = $1::bigint
+        AND dead_letter = FALSE
+        AND status IN ('processing', 'failed')
+      RETURNING id::text, payload, status, attempts, created_at::text
+      `,
+      [id],
+    );
 
-    const task = this.tasks[index];
-    if (!task || (task.status !== "processing" && task.status !== "failed")) {
-      return undefined;
-    }
-
-    task.status = "failed";
-    this.tasks.splice(index, 1);
-    this.deadLetters.push(task);
-    return task;
+    const row = rows[0];
+    return row ? mapRow<T>(row) : undefined;
   }
 
   /** Snapshot of dead-letter tasks. Returned tasks are frozen copies. */
-  getDeadLetters(): ReadonlyArray<Readonly<Task<T>>> {
-    return this.deadLetters.map((task) => Object.freeze({ ...task }));
-  }
+  async getDeadLetters(): Promise<ReadonlyArray<Readonly<Task<T>>>> {
+    const { rows } = await pool.query<TaskRow>(`
+      SELECT id::text, payload, status, attempts, created_at::text
+      FROM tasks
+      WHERE dead_letter = TRUE
+      ORDER BY created_at ASC, id ASC
+    `);
 
-  private findProcessing(id: string): Task<T> | undefined {
-    const task = this.tasks.find((t) => t.id === id);
-    if (!task || task.status !== "processing") {
-      return undefined;
-    }
-    return task;
+    return rows.map((row) => Object.freeze(mapRow<T>(row)));
   }
 }
