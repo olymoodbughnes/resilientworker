@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { closeDb, ensureSchema } from "./db";
+import { closeDb, ensureSchema, pool } from "./db";
 import { TaskQueue } from "./queue";
 import { Worker } from "./worker";
 import type { EmailPayload } from "./services/notification";
@@ -9,15 +9,28 @@ async function main() {
 
   const queue = new TaskQueue<EmailPayload>();
 
-  await queue.add({
+  const first = await queue.add({
     to: "customer@example.com",
     subject: "Order confirmation",
   });
 
-  await queue.add({
+  const second = await queue.add({
     to: "customer2@example.com",
     subject: "Your order has shipped",
   });
+
+  // Prove jobs are in Postgres, not just memory.
+  const { rows: stored } = await pool.query<{
+    id: string;
+    status: string;
+  }>(`
+    SELECT id::text, status
+    FROM tasks
+    WHERE id IN ($1::bigint, $2::bigint)
+    ORDER BY id ASC
+  `, [first.id, second.id]);
+
+  console.log("[postgres] verified rows after insert:", stored);
 
   const worker = new Worker(queue);
 

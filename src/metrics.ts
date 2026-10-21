@@ -1,7 +1,10 @@
 export type MetricsSnapshot = {
   successes: number;
   failures: number;
+  /** Retries after a real service/action failure. */
   retries: number;
+  /** Attempts blocked because the circuit was open. */
+  circuitRejections: number;
   totalProcessingTimeMs: number;
   averageProcessingTimeMs: number;
 };
@@ -10,6 +13,7 @@ export class Metrics {
   private successes = 0;
   private failures = 0;
   private retries = 0;
+  private circuitRejections = 0;
   private totalProcessingTimeMs = 0;
 
   recordSuccess(processingTimeMs: number): void {
@@ -33,6 +37,13 @@ export class Metrics {
     console.log(`[metrics] retry (+1) totalRetries=${this.retries}`);
   }
 
+  recordCircuitRejection(): void {
+    this.circuitRejections++;
+    console.log(
+      `[metrics] circuitRejection (+1) total=${this.circuitRejections}`
+    );
+  }
+
   getSnapshot(): MetricsSnapshot {
     const finished = this.successes + this.failures;
 
@@ -40,6 +51,7 @@ export class Metrics {
       successes: this.successes,
       failures: this.failures,
       retries: this.retries,
+      circuitRejections: this.circuitRejections,
       totalProcessingTimeMs: this.totalProcessingTimeMs,
       averageProcessingTimeMs:
         finished === 0

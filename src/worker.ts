@@ -1,5 +1,5 @@
 import { sleep, calculateBackoff } from "./backoff";
-import { CircuitBreaker } from "./circuitbreaker";
+import { CircuitBreaker, CircuitOpenError } from "./circuitbreaker";
 import { Metrics } from "./metrics";
 import { TaskQueue } from "./queue";
 import {
@@ -31,9 +31,10 @@ export class Worker {
     const startedAt = Date.now();
 
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
-      try {
-        console.log(`Attempt ${attempt}/${this.maxAttempts}`);
+      await this.queue.recordAttempt(task.id);
+      console.log(`Attempt ${attempt}/${this.maxAttempts}`);
 
+      try {
         await this.circuit.execute(() => sendEmail(task.payload));
 
         await this.queue.complete(task.id);
@@ -41,6 +42,8 @@ export class Worker {
         console.log(`Task ${task.id} completed.`);
         return true;
       } catch (error) {
+        const blockedByCircuit = error instanceof CircuitOpenError;
+
         console.error(
           `Task ${task.id} failed on attempt ${attempt}:`,
           error instanceof Error ? error.message : error
@@ -53,17 +56,25 @@ export class Worker {
         }
 
         if (attempt < this.maxAttempts) {
-          this.metrics.recordRetry();
-
-          if (this.circuit.getStatus() === "OPEN") {
+          if (blockedByCircuit) {
+            this.metrics.recordCircuitRejection();
             console.log(
               `Circuit open, waiting ${this.circuitCooldown}ms before retry...`
             );
             await sleep(this.circuitCooldown);
           } else {
-            const delay = calculateBackoff(attempt);
-            console.log(`Waiting ${delay}ms before retry...`);
-            await sleep(delay);
+            this.metrics.recordRetry();
+
+            if (this.circuit.getStatus() === "OPEN") {
+              console.log(
+                `Circuit open, waiting ${this.circuitCooldown}ms before retry...`
+              );
+              await sleep(this.circuitCooldown);
+            } else {
+              const delay = calculateBackoff(attempt);
+              console.log(`Waiting ${delay}ms before retry...`);
+              await sleep(delay);
+            }
           }
         }
       }

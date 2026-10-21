@@ -1,5 +1,12 @@
 type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
 
+export class CircuitOpenError extends Error {
+  constructor() {
+    super("Circuit breaker is OPEN");
+    this.name = "CircuitOpenError";
+  }
+}
+
 export class CircuitBreaker {
   private state: CircuitState = "CLOSED";
   private failures = 0;
@@ -13,7 +20,7 @@ export class CircuitBreaker {
   async execute<T>(action: () => Promise<T>): Promise<T> {
     if (this.state === "OPEN") {
       if (Date.now() - this.openedAt < this.cooldown) {
-        throw new Error("Circuit breaker is OPEN");
+        throw new CircuitOpenError();
       }
 
       this.state = "HALF_OPEN";
